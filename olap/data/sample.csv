@@ -1,0 +1,8 @@
+user_email,prosthesis_id,signal_strength,battery_percentage
+user1@example.com,prosthesis_001,0.78,92
+user1@example.com,prosthesis_001,0.85,75
+user1@example.com,prosthesis_001,0.72,70
+user2@example.com,prosthesis_002,0.90,25
+user2@example.com,prosthesis_002,0.80,13
+user3@example.com,prosthesis_003,0.95,56
+user3@example.com,prosthesis_003,0.88,52
