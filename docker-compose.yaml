@@ -1,5 +1,36 @@
 version: '3.8'
 
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: ./olap/Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor 
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_postgres/airflow
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow_postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ''
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: ''
+    AIRFLOW_INPUT_DIR: '/opt/airflow/dag-inputs'
+    CLICKHOUSE_DATABASE: airflow
+    CLICKHOUSE_USERNAME: airflow
+    CLICKHOUSE_PASSWORD: airflow
+  volumes:
+    - ./olap/dags:/opt/airflow/dags
+    - ./olap/dags/sql:/opt/airflow/dags/sql
+    - ./olap/requirements.txt:/opt/airflow/requirements.txt
+    - ./olap/data:/opt/airflow/sample_files
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+  networks:
+    - dag_net
+
+
 services:
   keycloak_db:
     image: postgres:14
@@ -7,10 +38,11 @@ services:
       POSTGRES_DB: keycloak_db
       POSTGRES_USER: keycloak_user
       POSTGRES_PASSWORD: keycloak_password
-    volumes:
-      - ./postgres-keycloak-data:/var/lib/postgresql/data
     ports:
       - "5433:5432"
+    networks:
+      - dag_net
+  
   keycloak:
     image: quay.io/keycloak/keycloak:21.1
     environment:
@@ -20,6 +52,7 @@ services:
       KC_DB_URL: jdbc:postgresql://keycloak_db:5432/keycloak_db
       KC_DB_USERNAME: keycloak_user
       KC_DB_PASSWORD: keycloak_password
+      KC_HEALTH_ENABLED: true
     command: 
       - start-dev
       - --import-realm
@@ -29,6 +62,15 @@ services:
       - "8080:8080"
     depends_on:
       - keycloak_db
+    networks:
+      - dag_net
+    healthcheck:
+      test: ['CMD-SHELL', '[ -f /tmp/HealthCheck.java ] || echo "public class HealthCheck { public static void main(String[] args) throws java.lang.Throwable { System.exit(java.net.HttpURLConnection.HTTP_OK == ((java.net.HttpURLConnection)new java.net.URL(args[0]).openConnection()).getResponseCode() ? 0 : 1); } }" > /tmp/HealthCheck.java && java /tmp/HealthCheck.java http://localhost:8080/health/live']
+      start_period: 10s
+      interval: 30s
+      retries: 3
+      timeout: 5s
+  
   frontend:
     build:
       context: ./frontend
@@ -36,7 +78,160 @@ services:
     ports:
       - "3000:3000"
     environment:
-      REACT_APP_API_URL: http://localhost:8000
-      REACT_APP_KEYCLOAK_URL: http://localhost:8080
+      REACT_APP_API_URL: http://api:8000
+      REACT_APP_KEYCLOAK_URL: http://keycloak:8080
       REACT_APP_KEYCLOAK_REALM: reports-realm
       REACT_APP_KEYCLOAK_CLIENT_ID: reports-frontend
+    networks:
+      - dag_net
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - 8000:8000
+    environment:
+      KEYCLOAK_URL: http://keycloak:8080
+      REALM: reports-realm
+      CLICKHOUSE_ADDR: olap_db:9000
+      CLICKHOUSE_DATABASE: airflow
+      CLICKHOUSE_USERNAME: airflow
+      CLICKHOUSE_PASSWORD: airflow
+    networks:
+      - dag_net
+
+  airflow_postgres:
+    image: postgres:16.0
+    volumes:
+      - ./olap/db/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test:
+        - CMD
+        - pg_isready
+        - -U
+        - airflow
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+    networks:
+      - dag_net
+
+  airflow-webserver:
+    <<: *airflow-common
+
+    ports:
+      - "8081:8080"
+    depends_on:
+      airflow_postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    command: webserver
+    networks:
+      - dag_net
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-scheduler:
+    <<: *airflow-common
+    networks:
+      - dag_net
+    command: scheduler
+    depends_on:
+      airflow_postgres:
+        condition: service_healthy
+      airflow-webserver:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD-SHELL", "curl -f http://localhost:8080/health || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  airflow-triggerer:
+    <<: *airflow-common
+    depends_on:
+      airflow_postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - dag_net
+    command: bash -c "airflow triggerer"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - airflow jobs check --job-type TriggererJob --hostname "${HOSTNAME}"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+
+  airflow-cli:
+    <<: *airflow-common
+    depends_on:
+      airflow_postgres:
+        condition: service_healthy
+    networks:
+      - dag_net
+    profiles:
+      - debug
+    command:
+      - bash
+      - -c
+      - airflow
+
+  airflow-init:
+    <<: *airflow-common
+    depends_on:
+      airflow_postgres:
+        condition: service_healthy
+      olap_db:
+        condition: service_healthy
+    command: >
+      bash -c " airflow db init && airflow users create \ --username admin \ --firstname admin \ --lastname admin \ --role Admin \ --email admin@sample.ru \ --password admin 
+      
+      "
+    networks:
+      - dag_net
+
+  olap_db:
+    image: clickhouse/clickhouse-server
+    environment:
+      CLICKHOUSE_USER: airflow
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_PASSWORD: airflow
+    volumes:
+      - ./olap/db/init-olap.sql:/docker-entrypoint-initdb.d/init-olap.sql
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    networks:
+      - dag_net
+    healthcheck:
+      test: wget --no-verbose --tries=1 http://127.0.0.1:8123/ping || exit 1
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+networks:
+  dag_net:

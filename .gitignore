@@ -1,2 +1,7 @@
 /postgres-keycloak-data
 2024__yandex-architecture-sso.code-workspace
+.DS_Store
+olap/dags/__pycache__
+olap/dags/sql
+backend/.env
+docs/*.xml
